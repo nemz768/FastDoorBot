@@ -9,6 +9,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 import httpx
 import secrets
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
@@ -232,6 +234,31 @@ async def handle_code(message: types.Message, state: FSMContext):
 
     await state.clear()
 
+
+# —— FastAPI: /send-message ——
+fastapi_app = FastAPI(title="FastDoor Bot API")
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class SendMessageRequest(BaseModel):
+    TgId: str | None
+    MaxId: str | None
+    message: str
+
+@fastapi_app.post("/send-message")
+async def send_message_api(request: SendMessageRequest):
+    try:
+        await bot.send_message(chat_id=request.TgId, text=request.message[:4096])
+        return {"status": "sent", "TgId": request.TgId, "MaxId": request.MaxId}
+    except Exception as e:
+        print(f"Не удалось отправить сообщение {request.TgId}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def start_bot():
     try:
         await dp.start_polling(bot)
@@ -240,9 +267,15 @@ async def start_bot():
     finally:
         await bot.session.close()
 
+async def start_fastapi():
+    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=3000)
+    server = uvicorn.Server(config)
+    await server.serve()
+
 async def main():
     print(f"Бот запущен. Режим: {ENV}, бэкенд: {BACKEND_BASE_URL}")
     await asyncio.gather(
+        start_fastapi(),
         start_bot()
     )
 
