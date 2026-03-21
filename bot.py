@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
+import logging
 
 from dotenv import load_dotenv
 import httpx
@@ -22,24 +23,24 @@ load_dotenv()
 
 # —— Настройки ——
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SMS_API_KEY = os.getenv("SMS_API_KEY")
 ENV = os.getenv("ENV", "dev")
 BACKEND_BASE_URL = os.getenv("BACKEND_PROD_URL") if ENV == "prod" else os.getenv("BACKEND_DEV_URL")
-
 SERVICES_LOGIN = os.getenv("SERVICES_LOGIN")
 SERVICES_PASSWORD = os.getenv("SERVICES_PASSWORD")
 service_cookies: httpx.Cookies | None = None
 
-# —— Блокировки: tg_id -> datetime до которого заблокирован ——
-blocked_users: dict[int, datetime] = {}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
+blocked_users: dict[int, datetime] = {}
 MAX_CODE_ATTEMPTS = 3
 BLOCK_MINUTES = 15
-
-# —— Хранилище авторизованных пользователей ——
 STORAGE_FILE = "authorized_users.json"
 
-required = ["TELEGRAM_BOT_TOKEN", "SMS_API_KEY"]
+required = ["TELEGRAM_BOT_TOKEN"]
 missing = [k for k in required if not os.getenv(k)]
 if missing:
     raise ValueError(f"Не хватает переменных в .env: {', '.join(missing)}")
@@ -57,7 +58,6 @@ class AuthStates(StatesGroup):
 
 # —— JSON хранилище ——
 def load_authorized() -> set[int]:
-    """Загружает авторизованных пользователей из файла."""
     if not os.path.exists(STORAGE_FILE):
         return set()
     try:
@@ -65,16 +65,15 @@ def load_authorized() -> set[int]:
             data = json.load(f)
             return set(data.get("tg_ids", []))
     except Exception as e:
-        print(f"[STORAGE] Ошибка чтения: {e}")
+        logger.error(f"[STORAGE] Ошибка чтения: {e}")
         return set()
 
 def save_authorized(tg_ids: set[int]):
-    """Сохраняет авторизованных пользователей в файл."""
     try:
         with open(STORAGE_FILE, "w", encoding="utf-8") as f:
             json.dump({"tg_ids": list(tg_ids)}, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[STORAGE] Ошибка записи: {e}")
+        logger.error(f"[STORAGE] Ошибка записи: {e}")
 
 def is_authorized_local(tg_id: int) -> bool:
     return tg_id in load_authorized()
@@ -83,7 +82,7 @@ def authorize_local(tg_id: int):
     tg_ids = load_authorized()
     tg_ids.add(tg_id)
     save_authorized(tg_ids)
-    print(f"[STORAGE] Сохранён tg_id={tg_id}")
+    logger.info(f"[STORAGE] Сохранён tg_id={tg_id}")
 
 
 # —— Вспомогательные функции ——
@@ -108,9 +107,9 @@ def is_blocked(tg_id: int) -> datetime | None:
 
 def block_user(tg_id: int):
     blocked_users[tg_id] = datetime.now() + timedelta(minutes=BLOCK_MINUTES)
-    print(f"[BLOCK] tg_id={tg_id} заблокирован до {blocked_users[tg_id]}")
+    logger.warning(f"[BLOCK] tg_id={tg_id} заблокирован до {blocked_users[tg_id]}")
 
-async def get_service_session() -> httpx.Cookies | None:
+async def get_service_session() -> httpx.Cookies:
     global service_cookies
     if service_cookies:
         return service_cookies
@@ -121,17 +120,17 @@ async def get_service_session() -> httpx.Cookies | None:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(url_login, json=data)
-            print("LOGIN STATUS:", response.status_code)
+            logger.info(f"[LOGIN] status={response.status_code}")
             if response.status_code == 200:
                 service_cookies = response.cookies
                 return service_cookies
-            return None
+            raise RuntimeError(f"Логин не удался: статус {response.status_code}")
+    except RuntimeError:
+        raise
     except Exception as e:
-        print(f"Ошибка при логине: {e}")
-        return None
+        raise RuntimeError(f"Ошибка при логине: {e}")
 
 async def get_installer_by_phone(phone: str) -> dict | None | bool:
-    """Возвращает dict если найден, None если 204, False если ошибка."""
     global service_cookies
     cookies = await get_service_session()
     if not cookies:
@@ -141,7 +140,7 @@ async def get_installer_by_phone(phone: str) -> dict | None | bool:
     try:
         async with httpx.AsyncClient(timeout=10.0, cookies=cookies) as client:
             response = await client.get(url)
-            print("STATUS:", response.status_code, "BODY:", response.text)
+            logger.info(f"[INSTALLER] status={response.status_code} phone={phone}")
             if response.status_code in (401, 403):
                 service_cookies = None
                 return False
@@ -151,12 +150,12 @@ async def get_installer_by_phone(phone: str) -> dict | None | bool:
                 return None
             return False
     except Exception as e:
-        print(f"Ошибка запроса installer: {e}")
+        logger.error(f"[INSTALLER] Ошибка запроса: {e}")
         return False
 
 async def send_verification_sms(phone: str, code: str) -> bool:
     if ENV == "dev":
-        print(f"[DEV] Код для {phone}: {code}")
+        logger.info(f"[DEV] Код для {phone}: {code}")
         return True
 
     cookies = await get_service_session()
@@ -167,12 +166,12 @@ async def send_verification_sms(phone: str, code: str) -> bool:
         async with httpx.AsyncClient(timeout=10.0, cookies=cookies) as client:
             response = await client.post(
                 f"{BACKEND_BASE_URL}/api/sms/sendVerificationMessage",
-                json={"phone_number": phone, "code": code}  
+                json={"phone_number": phone, "code": code}
             )
-            print(f"[SMS] status={response.status_code} body={response.text}")
+            logger.info(f"[SMS] status={response.status_code} phone={phone}")
             return response.status_code == 200
     except Exception as e:
-        print(f"[SMS] Ошибка: {e}")
+        logger.error(f"[SMS] Ошибка отправки: {e}")
         return False
 
 async def update_installer_tg(
@@ -181,7 +180,6 @@ async def update_installer_tg(
     phone: str,
     tg_id: int,
 ) -> bool:
-    """Сохраняем tgId установщика."""
     global service_cookies
     cookies = await get_service_session()
     if not cookies:
@@ -197,12 +195,12 @@ async def update_installer_tg(
     try:
         async with httpx.AsyncClient(timeout=10.0, cookies=cookies) as client:
             response = await client.put(f"{BACKEND_BASE_URL}/api/installer", params=params)
-            print("PUT STATUS:", response.status_code, "BODY:", response.text)
+            logger.info(f"[PUT] status={response.status_code} installer_id={installer_id}")
             if response.status_code in (401, 403):
                 service_cookies = None
             return response.status_code == 200
     except Exception as e:
-        print(f"[PUT] Ошибка: {e}")
+        logger.error(f"[PUT] Ошибка: {e}")
         return False
 
 
@@ -210,7 +208,7 @@ async def update_installer_tg(
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     tg_id = message.from_user.id
-    print(f"Пользователь запустил бота. tg_id={tg_id}")
+    logger.info(f"[START] tg_id={tg_id}")
 
     blocked_until = is_blocked(tg_id)
     if blocked_until:
@@ -222,9 +220,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
 
     if is_authorized_local(tg_id):
-        await message.answer(
-            "Вы уже авторизованы.\nЗаказы будут приходить автоматически."
-        )
+        await message.answer("Вы уже авторизованы.\nЗаказы будут приходить автоматически.")
         return
 
     await state.clear()
@@ -239,7 +235,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def handle_contact(message: types.Message, state: FSMContext):
     tg_id = message.from_user.id
 
-    # Проверяем блокировку
     blocked_until = is_blocked(tg_id)
     if blocked_until:
         remaining = int((blocked_until - datetime.now()).total_seconds() / 60) + 1
@@ -263,7 +258,6 @@ async def handle_contact(message: types.Message, state: FSMContext):
             )
             return
 
-       
         installer = await get_installer_by_phone(phone)
 
         if installer is False:
@@ -305,7 +299,7 @@ async def handle_contact(message: types.Message, state: FSMContext):
         await state.set_state(AuthStates.waiting_for_code)
 
     except Exception as e:
-        print(f"Ошибка в хендлере contact: {e}")
+        logger.error(f"[CONTACT] Ошибка tg_id={tg_id}: {e}")
         await state.clear()
         await message.answer("Произошла ошибка. Попробуйте ещё раз.")
 
@@ -324,6 +318,7 @@ async def handle_code(message: types.Message, state: FSMContext):
         code_attempts += 1
         await state.update_data(code_attempts=code_attempts)
         remaining_attempts = MAX_CODE_ATTEMPTS - code_attempts
+        logger.warning(f"[CODE] Неверный код tg_id={tg_id} попытка={code_attempts}")
 
         if code_attempts >= MAX_CODE_ATTEMPTS:
             block_user(tg_id)
@@ -334,9 +329,7 @@ async def handle_code(message: types.Message, state: FSMContext):
             )
             return
 
-        await message.answer(
-            f"Неверный код. Осталось попыток: {remaining_attempts}."
-        )
+        await message.answer(f"Неверный код. Осталось попыток: {remaining_attempts}.")
         return
 
     success = await update_installer_tg(
@@ -348,11 +341,13 @@ async def handle_code(message: types.Message, state: FSMContext):
 
     if success:
         authorize_local(tg_id)
+        logger.info(f"[AUTH] Успешная авторизация tg_id={tg_id} phone={phone}")
         await message.answer(
             "Авторизация успешна!\nТеперь вы будете получать новые заказы.",
             reply_markup=types.ReplyKeyboardRemove()
         )
     else:
+        logger.error(f"[AUTH] Ошибка обновления tg_id={tg_id}")
         await message.answer("Ошибка обновления данных. Обратитесь в поддержку.")
 
     await state.clear()
@@ -369,16 +364,16 @@ fastapi_app.add_middleware(
 
 class SendMessageRequest(BaseModel):
     TgId: str | None
-    MaxId: str | None
     message: str
 
 @fastapi_app.post("/send-message")
 async def send_message_api(request: SendMessageRequest):
     try:
         await bot.send_message(chat_id=request.TgId, text=request.message[:4096])
-        return {"status": "sent", "TgId": request.TgId, "MaxId": request.MaxId}
+        logger.info(f"[SENT] TgId={request.TgId}")
+        return {"status": "sent", "TgId": request.TgId}
     except Exception as e:
-        print(f"Не удалось отправить сообщение {request.TgId}: {e}")
+        logger.error(f"[FAIL] TgId={request.TgId} error={e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -386,12 +381,12 @@ async def start_bot():
     try:
         await dp.start_polling(bot)
     except Exception as e:
-        print(f"Ошибка polling: {e}")
+        logger.error(f"[POLLING] Ошибка: {e}")
     finally:
         await bot.session.close()
 
 async def start_fastapi():
-    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=3000)
+    config = uvicorn.Config(fastapi_app, host="127.0.0.1", port=8082)
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -399,8 +394,16 @@ async def main():
     global service_cookies
     service_cookies = None
     authorized = load_authorized()
-    print(f"Бот запущен. Режим: {ENV}, бэкенд: {BACKEND_BASE_URL}")
-    print(f"Загружено авторизованных пользователей: {len(authorized)}")
+    logger.info(f"Бот запущен. Режим: {ENV}, бэкенд: {BACKEND_BASE_URL}")
+    logger.info(f"Загружено авторизованных пользователей: {len(authorized)}")
+
+    try:
+        await get_service_session()
+        logger.info("[OK] Сессия на бэке получена.")
+    except RuntimeError as e:
+        logger.critical(f"[FATAL] {e}")
+        return
+
     await asyncio.gather(
         start_fastapi(),
         start_bot()
